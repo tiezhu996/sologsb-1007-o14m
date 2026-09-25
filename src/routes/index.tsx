@@ -14,6 +14,7 @@ import {
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
+import { collectRedactionIssues, redactText, type RedactionIssue, type RedactionSegmentRef } from "../redaction";
 import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
@@ -115,6 +116,10 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [redactPreview, setRedactPreview] = createSignal(false);
+  const [redactOriginal, setRedactOriginal] = createSignal("");
+  const [redactAlias, setRedactAlias] = createSignal("");
+  const [exportIssues, setExportIssues] = createSignal<RedactionIssue[] | null>(null);
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -141,6 +146,10 @@ export default function OralHistoryEditor() {
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
+  const redactionIssues = createMemo(() => collectRedactionIssues(project()));
+  const redactionActive = createMemo(() => redactPreview() && project().redactions.length > 0);
+  /** List/export view of a string: aliased while the redaction preview is on, raw otherwise. */
+  const displayText = (text: string) => (redactionActive() ? redactText(text, project().redactions) : text);
 
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
@@ -321,12 +330,55 @@ export default function OralHistoryEditor() {
     });
   };
 
+  const addRedaction = () => {
+    const original = redactOriginal().trim();
+    const alias = redactAlias().trim();
+    if (!original || !alias) return;
+    commit("登记脱敏化名", (draft) => {
+      draft.redactions.push({ id: uid("redact"), original, alias });
+    });
+    setRedactOriginal("");
+    setRedactAlias("");
+  };
+
+  const removeRedaction = (id: string) => {
+    commit("删除脱敏登记", (draft) => {
+      draft.redactions = draft.redactions.filter((entry) => entry.id !== id);
+    });
+  };
+
+  const jumpToSegment = (ref: RedactionSegmentRef) => {
+    setExportIssues(null);
+    setTrackFilter("all");
+    if (project().activeTrackId !== ref.trackId) {
+      commit("定位冲突片段", (draft) => {
+        draft.activeTrackId = ref.trackId;
+      });
+    }
+    setSelectedId(ref.segmentId);
+    requestAnimationFrame(() =>
+      document.getElementById(`segment-${ref.segmentId}`)?.scrollIntoView({ block: "center", behavior: "smooth" }),
+    );
+  };
+
   const exportSrt = () => {
+    const redact = redactionActive();
+    if (redact) {
+      const issues = redactionIssues();
+      if (issues.length) {
+        setExportIssues(issues);
+        setLastAction("导出已暂停：先处理脱敏冲突");
+        return;
+      }
+    }
     const lines = activeTrack().segments.map((segment, index) => {
       const speaker = speakerById(segment.speakerId)?.name ?? "未知";
-      return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${segment.text}\n`;
+      const name = redact ? redactText(speaker, project().redactions) : speaker;
+      const text = redact ? redactText(segment.text, project().redactions) : segment.text;
+      return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${name}：${text}\n`;
     });
     downloadText(`${project().title}-${activeTrack().name}.srt`, lines.join("\n"), "application/x-subrip;charset=utf-8");
+    setLastAction(redact ? "已导出脱敏字幕" : "已导出字幕");
   };
 
   const importFile = async (file: File) => {
@@ -490,7 +542,7 @@ export default function OralHistoryEditor() {
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
           <button class="btn btn-quiet" onClick={() => setHelpOpen(true)}>快捷键 <kbd>?</kbd></button>
-          <button class="btn btn-primary" onClick={exportSrt}>导出 SRT</button>
+          <button class="btn btn-primary" onClick={exportSrt}>{redactionActive() ? "导出脱敏 SRT" : "导出 SRT"}</button>
         </div>
       </header>
 
@@ -534,6 +586,45 @@ export default function OralHistoryEditor() {
             <div class="hint">支持 SRT / VTT / 每行 `[00:12] 文本`</div>
           </section>
 
+          <section class="panel-section redaction-section">
+            <div class="section-title">
+              <h2>脱敏登记</h2>
+              <span>{project().redactions.length}</span>
+            </div>
+            <p class="redaction-hint">登记后，预览与导出的字幕会用化名替换原名；编辑框始终保留原稿。登记可随撤销退回。</p>
+            <For each={project().redactions} fallback={<div class="mini-empty redaction-empty">尚未登记要藏起的名字。</div>}>
+              {(entry) => (
+                <div class="redaction-entry">
+                  <span class="redaction-pair"><b>{entry.original}</b><i>→</i><em>{entry.alias}</em></span>
+                  <button title="删除登记" onClick={() => removeRedaction(entry.id)}>×</button>
+                </div>
+              )}
+            </For>
+            <div class="redaction-form">
+              <input
+                aria-label="要藏起的名字"
+                placeholder="要藏起的名字"
+                value={redactOriginal()}
+                onInput={(event) => setRedactOriginal(event.currentTarget.value)}
+              />
+              <input
+                aria-label="化名"
+                placeholder="化名"
+                value={redactAlias()}
+                onInput={(event) => setRedactAlias(event.currentTarget.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") addRedaction(); }}
+              />
+              <button class="wide-action" disabled={!redactOriginal().trim() || !redactAlias().trim()} onClick={addRedaction}>
+                <span>＋</span> 登记化名
+              </button>
+            </div>
+            <Show when={redactionIssues().length > 0}>
+              <button class="redaction-warning" onClick={() => setExportIssues(redactionIssues())}>
+                ⚠ {redactionIssues().length} 项脱敏冲突，导出前需处理
+              </button>
+            </Show>
+          </section>
+
           <section class="panel-section tag-summary">
             <div class="section-title"><h2>标注实体</h2><span>{project().tags.length}</span></div>
             <div class="legend">
@@ -556,7 +647,23 @@ export default function OralHistoryEditor() {
               <button class={trackFilter() === "unreviewed" ? "active" : ""} onClick={() => setTrackFilter("unreviewed")}>未校对</button>
               <button class={trackFilter() === "low" ? "active" : ""} onClick={() => setTrackFilter("low")}>低置信</button>
             </div>
+            <button
+              class={`redact-toggle ${redactPreview() ? "on" : ""}`}
+              title="打开后，片段列表与导出字幕使用化名，编辑框仍显示原稿"
+              onClick={() => setRedactPreview((value) => !value)}
+            >
+              {redactPreview() ? "◉ 脱敏预览 开" : "○ 脱敏预览 关"}
+            </button>
           </div>
+
+          <Show when={redactionActive()}>
+            <div class="redact-banner" role="status">
+              脱敏预览中：列表与导出使用化名，右侧编辑框保留原稿。
+              <Show when={redactionIssues().length > 0}>
+                <button onClick={() => setExportIssues(redactionIssues())}>⚠ {redactionIssues().length} 项冲突</button>
+              </Show>
+            </div>
+          </Show>
 
           <div class="transcript-list" role="listbox" aria-label="转写片段">
             <For each={visibleSegments()}>
@@ -575,14 +682,15 @@ export default function OralHistoryEditor() {
                   </div>
                   <div class="segment-body">
                     <div class="segment-meta">
-                      <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
+                      <b>{displayText(speakerById(segment.speakerId)?.name ?? "未知发言人")}</b>
                       <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
                       <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={redactionActive() && displayText(segment.text) !== segment.text}><span class="pill redact">已脱敏</span></Show>
                     </div>
-                    <p>{segment.text}</p>
+                    <p>{displayText(segment.text)}</p>
                     <div class="segment-tags">
                       <For each={segment.tagIds.map(tagById).filter(Boolean)}>
                         {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
@@ -640,6 +748,9 @@ export default function OralHistoryEditor() {
                     onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
                   />
                   <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
+                  <Show when={redactionActive()}>
+                    <div class="redact-note">脱敏预览已开启：此编辑框仍显示原稿，化名只用于列表与导出。</div>
+                  </Show>
 
                   <div class="field-label">置信度</div>
                   <div class="confidence-picker" role="radiogroup" aria-label="置信度">
@@ -725,6 +836,37 @@ export default function OralHistoryEditor() {
         <span>版本 {revision() + 1} · 本地草稿</span>
         <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
       </footer>
+
+      <Dialog open={exportIssues() !== null} onOpenChange={(open) => { if (!open) setExportIssues(null); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content redaction-dialog">
+            <Dialog.Title>导出已暂停：脱敏冲突</Dialog.Title>
+            <Dialog.Description>解决以下冲突后才能导出脱敏字幕。点击片段编号可定位到对应轨道。</Dialog.Description>
+            <div class="issue-list">
+              <For each={exportIssues() ?? []}>
+                {(issue) => (
+                  <div class={`issue-card ${issue.kind}`}>
+                    <strong>{issue.title}</strong>
+                    <p>{issue.detail}</p>
+                    <div class="issue-refs">
+                      <For each={issue.refs}>
+                        {(ref) => (
+                          <button title={ref.excerpt} onClick={() => jumpToSegment(ref)}>
+                            {ref.trackName} · 片段 {ref.position}
+                          </button>
+                        )}
+                      </For>
+                      <Show when={!issue.refs.length}><span class="issue-no-ref">未在片段原文中找到出现位置</span></Show>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+            <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setExportIssues(null)}>返回修改</button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
 
       <Dialog open={helpOpen()} onOpenChange={setHelpOpen}>
         <Dialog.Portal>

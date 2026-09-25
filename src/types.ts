@@ -55,6 +55,14 @@ export interface TranscriptTrack {
   segments: Segment[];
 }
 
+export interface RedactionEntry {
+  id: string;
+  /** 要藏起的原名 */
+  original: string;
+  /** 对外使用的化名 */
+  alias: string;
+}
+
 export interface ProjectData {
   id: string;
   title: string;
@@ -64,6 +72,7 @@ export interface ProjectData {
   speakers: Speaker[];
   tags: Tag[];
   tracks: TranscriptTrack[];
+  redactions: RedactionEntry[];
   updatedAt: string;
 }
 

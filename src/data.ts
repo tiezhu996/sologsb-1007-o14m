@@ -70,6 +70,7 @@ export const createSeedProject = (): ProjectData => {
       { id: "sp-chen", name: "陈师傅", role: "旁述人", color: "#0f766e" },
     ],
     tags,
+    redactions: [],
     tracks: [
       {
         id: "track-zh",

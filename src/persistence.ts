@@ -11,6 +11,8 @@ export function loadProject(): { project: ProjectData; revision: number } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
     if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
+      // Drafts saved before the redaction registry existed get an empty one.
+      if (!Array.isArray(parsed.project.redactions)) parsed.project.redactions = [];
       return { project: parsed.project, revision: parsed.revision ?? 0 };
     }
   } catch {
