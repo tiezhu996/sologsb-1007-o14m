@@ -14,6 +14,8 @@ import {
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
+import { anonymizeParts, anonymizeText, validateAliases } from "../anonymize";
+import type { AliasIssue, SegmentRef } from "../anonymize";
 import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
@@ -115,6 +117,9 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [maskMode, setMaskMode] = createSignal(false);
+  const [aliasEditorOpen, setAliasEditorOpen] = createSignal(false);
+  const [exportBlocked, setExportBlocked] = createSignal<AliasIssue[] | null>(null);
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -141,6 +146,34 @@ export default function OralHistoryEditor() {
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
+
+  const aliasIssues = createMemo<AliasIssue[]>(() => validateAliases(project()));
+  const issueByEntry = createMemo(() => {
+    const map = new Map<string, AliasIssue[]>();
+    for (const issue of aliasIssues()) {
+      for (const entryId of issue.entryIds) {
+        const list = map.get(entryId) ?? [];
+        list.push(issue);
+        map.set(entryId, list);
+      }
+    }
+    return map;
+  });
+  /** 预览或导出时使用的化名文本；非脱敏视图下直接返回原文。 */
+  const displayText = (text: string) =>
+    maskMode() ? anonymizeText(text, project().aliases) : text;
+
+  const jumpToRef = (ref: SegmentRef) => {
+    setExportBlocked(null);
+    setAliasEditorOpen(false);
+    if (project().activeTrackId !== ref.trackId) {
+      switchTrack(ref.trackId);
+    }
+    setSelectedId(ref.segmentId);
+    queueMicrotask(() =>
+      document.getElementById(`segment-${ref.segmentId}`)?.scrollIntoView({ block: "center", behavior: "smooth" }),
+    );
+  };
 
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
@@ -321,12 +354,39 @@ export default function OralHistoryEditor() {
     });
   };
 
-  const exportSrt = () => {
-    const lines = activeTrack().segments.map((segment, index) => {
-      const speaker = speakerById(segment.speakerId)?.name ?? "未知";
-      return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${segment.text}\n`;
+  const addAliasEntry = () => {
+    commit("登记化名", (draft) => {
+      draft.aliases.push({ id: uid("alias"), source: "", alias: "" });
     });
-    downloadText(`${project().title}-${activeTrack().name}.srt`, lines.join("\n"), "application/x-subrip;charset=utf-8");
+  };
+
+  const updateAliasEntry = (entryId: string, field: "source" | "alias", value: string) => {
+    commit("修改化名登记", (draft) => {
+      const entry = draft.aliases.find((item) => item.id === entryId);
+      if (entry) entry[field] = value;
+    });
+  };
+
+  const removeAliasEntry = (entryId: string) => {
+    commit("删除化名登记", (draft) => {
+      draft.aliases = draft.aliases.filter((item) => item.id !== entryId);
+    });
+  };
+
+  const exportSrt = () => {
+    if (maskMode() && aliasIssues().length) {
+      setExportBlocked(aliasIssues());
+      return;
+    }
+    const aliases = project().aliases;
+    const lines = activeTrack().segments.map((segment, index) => {
+      const speakerName = speakerById(segment.speakerId)?.name ?? "未知";
+      const speaker = maskMode() ? anonymizeText(speakerName, aliases) : speakerName;
+      const text = maskMode() ? anonymizeText(segment.text, aliases) : segment.text;
+      return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${text}\n`;
+    });
+    const suffix = maskMode() ? "-脱敏" : "";
+    downloadText(`${project().title}-${activeTrack().name}${suffix}.srt`, lines.join("\n"), "application/x-subrip;charset=utf-8");
   };
 
   const importFile = async (file: File) => {
@@ -490,6 +550,15 @@ export default function OralHistoryEditor() {
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
           <button class="btn btn-quiet" onClick={() => setHelpOpen(true)}>快捷键 <kbd>?</kbd></button>
+          <button class="btn btn-quiet" onClick={() => setAliasEditorOpen(true)}>化名登记</button>
+          <button
+            class={`btn ${maskMode() ? "btn-mask-on" : "btn-quiet"}`}
+            aria-pressed={maskMode()}
+            title={maskMode() ? "片段列表与导出显示化名，编辑框保留原稿" : "开启后片段列表与导出使用化名"}
+            onClick={() => setMaskMode((value) => !value)}
+          >
+            脱敏预览：{maskMode() ? "开" : "关"}
+          </button>
           <button class="btn btn-primary" onClick={exportSrt}>导出 SRT</button>
         </div>
       </header>
@@ -558,6 +627,19 @@ export default function OralHistoryEditor() {
             </div>
           </div>
 
+          <Show when={maskMode()}>
+            <div class={`mask-banner ${aliasIssues().length ? "has-issues" : ""}`} role="status">
+              <Show
+                when={aliasIssues().length}
+                fallback={<><b>脱敏预览中</b><span>列表与导出显示化名，右侧编辑框仍为原稿；化名在各条轨道间共用。</span></>}
+              >
+                <b>化名登记存在 {aliasIssues().length} 处冲突，导出会暂停</b>
+                <span>检查同一原名是否配了多个化名，或化名是否撞上原文里的人物名。</span>
+                <button class="banner-link" onClick={() => setAliasEditorOpen(true)}>查看并处理</button>
+              </Show>
+            </div>
+          </Show>
+
           <div class="transcript-list" role="listbox" aria-label="转写片段">
             <For each={visibleSegments()}>
               {(segment, index) => (
@@ -575,17 +657,28 @@ export default function OralHistoryEditor() {
                   </div>
                   <div class="segment-body">
                     <div class="segment-meta">
-                      <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
+                      <b class={maskMode() ? "masked-name" : ""}>{displayText(speakerById(segment.speakerId)?.name ?? "未知发言人")}</b>
                       <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
                       <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={maskMode()}><span class="pill masked-pill">脱敏</span></Show>
                     </div>
-                    <p>{segment.text}</p>
+                    <p class={maskMode() ? "masked-text" : ""}>
+                      {maskMode() ? (
+                        <For each={anonymizeParts(segment.text, project().aliases)}>
+                          {(part) => (part.masked ? <mark class="alias-mark">{part.value}</mark> : part.value)}
+                        </For>
+                      ) : segment.text}
+                    </p>
                     <div class="segment-tags">
                       <For each={segment.tagIds.map(tagById).filter(Boolean)}>
-                        {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
+                        {(tag) => (
+                          <span style={{ "--tag-color": tag!.color } as any}>
+                            #{maskMode() && tag!.type === "person" ? anonymizeText(tag!.label, project().aliases) : tag!.label}
+                          </span>
+                        )}
                       </For>
                     </div>
                   </div>
@@ -639,7 +732,10 @@ export default function OralHistoryEditor() {
                     value={segment().text}
                     onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
                   />
-                  <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
+                  <div class="textarea-help">
+                    光标停在句中后点击“拆分”，系统会保留两侧时间码比例。
+                    <Show when={maskMode()}><b class="mask-edit-note">脱敏预览开启时，编辑框始终保留原稿；化名只出现在片段列表与导出文件。</b></Show>
+                  </div>
 
                   <div class="field-label">置信度</div>
                   <div class="confidence-picker" role="radiogroup" aria-label="置信度">
@@ -725,6 +821,114 @@ export default function OralHistoryEditor() {
         <span>版本 {revision() + 1} · 本地草稿</span>
         <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
       </footer>
+
+      <Dialog open={aliasEditorOpen()} onOpenChange={setAliasEditorOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content alias-dialog">
+            <Dialog.Title>化名登记</Dialog.Title>
+            <Dialog.Description>
+              登记受访人不愿公开的姓名、地名与化名。同一原名在所有轨道共用一个化名；登记随草稿保存在本机，可用 Ctrl/⌘+Z 退回登记前。
+            </Dialog.Description>
+
+            <div class="alias-header-row">
+              <span>原名 / 地名</span>
+              <span>化名</span>
+              <span />
+            </div>
+            <div class="alias-rows">
+              <For each={project().aliases} fallback={<div class="mini-empty">还没有登记。点击下方按钮添加第一条。</div>}>
+                {(entry) => {
+                  const rowIssues = createMemo(() => issueByEntry().get(entry.id) ?? []);
+                  return (
+                    <div class={`alias-row-wrap ${rowIssues().length ? "has-issues" : ""}`}>
+                      <div class="alias-row">
+                        <input
+                          aria-label="原名"
+                          value={entry.source}
+                          placeholder="如：林有德 / 台江码头"
+                          onChange={(event) => updateAliasEntry(entry.id, "source", event.currentTarget.value)}
+                        />
+                        <span class="alias-arrow">→</span>
+                        <input
+                          aria-label="化名"
+                          value={entry.alias}
+                          placeholder="如：林某 / 甲码头"
+                          onChange={(event) => updateAliasEntry(entry.id, "alias", event.currentTarget.value)}
+                        />
+                        <button class="alias-remove" title="删除该登记" onClick={() => removeAliasEntry(entry.id)}>✕</button>
+                      </div>
+                      <For each={rowIssues()}>
+                        {(issue) => (
+                          <div class="alias-row-issue">
+                            {issue.code === "duplicate-source"
+                              ? <>原名「{issue.source}」配了多个化名：{issue.aliases?.join("、")}，导出无法确定用哪个。</>
+                              : <>化名「{issue.alias}」会与原文里另一个人物混淆{issue.reasons.length ? `：${issue.reasons.join("；")}` : ""}。</>}
+                            <For each={issue.segments.slice(0, 6)}>
+                              {(ref) => (
+                                <button class="seg-chip" onClick={() => jumpToRef(ref)}>
+                                  {ref.trackName} · 第 {ref.index} 段
+                                </button>
+                              )}
+                            </For>
+                            <Show when={issue.segments.length > 6}><span class="seg-chip-more">等 {issue.segments.length} 段</span></Show>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  );
+                }}
+              </For>
+            </div>
+            <button class="wide-action" onClick={addAliasEntry}><span>＋</span> 添加一条化名</button>
+            <div class="alias-footer-note">
+              {aliasIssues().length
+                ? `当前有 ${aliasIssues().length} 处冲突，脱敏导出会先暂停，处理完再导出。`
+                : "没有冲突。开启「脱敏预览」后，片段列表与导出字幕将显示化名；编辑框始终保留原稿。"}
+            </div>
+            <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setAliasEditorOpen(false)}>完成</button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={exportBlocked() !== null} onOpenChange={(open) => !open && setExportBlocked(null)}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content">
+            <Dialog.Title>脱敏导出已暂停</Dialog.Title>
+            <Dialog.Description>化名登记存在冲突，为避免把真实身份写进字幕，请先处理以下问题再导出。</Dialog.Description>
+            <div class="blocked-list">
+              <For each={exportBlocked() ?? []}>
+                {(issue) => (
+                  <article class="blocked-item">
+                    <strong>
+                      {issue.code === "duplicate-source"
+                        ? `「${issue.source}」配了多个化名：${issue.aliases?.join("、")}`
+                        : `化名「${issue.alias}」撞上原文里另一个人物`}
+                    </strong>
+                    <Show when={issue.reasons.length}><p>{issue.reasons.join("；")}</p></Show>
+                    <div class="blocked-refs">
+                      <span>涉及片段（{issue.segments.length}）：</span>
+                      <For each={issue.segments.slice(0, 12)}>
+                        {(ref) => (
+                          <button class="seg-chip" onClick={() => jumpToRef(ref)}>
+                            {ref.trackName} · 第 {ref.index} 段 · {formatTime(ref.start, false)}
+                          </button>
+                        )}
+                      </For>
+                      <Show when={issue.segments.length > 12}><span class="seg-chip-more">等 {issue.segments.length} 段</span></Show>
+                      <Show when={!issue.segments.length}><span class="seg-chip-more">（请查看发言人名单或人物标注）</span></Show>
+                    </div>
+                  </article>
+                )}
+              </For>
+            </div>
+            <div class="dialog-footer">
+              <button class="btn btn-quiet" onClick={() => { setExportBlocked(null); setAliasEditorOpen(true); }}>去修改登记</button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
 
       <Dialog open={helpOpen()} onOpenChange={setHelpOpen}>
         <Dialog.Portal>

@@ -30,6 +30,12 @@ export interface Tag {
   color: string;
 }
 
+export interface AliasEntry {
+  id: string;
+  source: string;
+  alias: string;
+}
+
 export interface Segment {
   id: string;
   start: number;
@@ -64,6 +70,8 @@ export interface ProjectData {
   speakers: Speaker[];
   tags: Tag[];
   tracks: TranscriptTrack[];
+  /** 脱敏登记：原名（可含地名）与化名的对应，在各条轨道间共用。 */
+  aliases: AliasEntry[];
   updatedAt: string;
 }
 

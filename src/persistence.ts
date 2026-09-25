@@ -11,6 +11,8 @@ export function loadProject(): { project: ProjectData; revision: number } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
     if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
+      // 旧版草稿还没有脱敏登记字段时补空数组。
+      parsed.project.aliases ??= [];
       return { project: parsed.project, revision: parsed.revision ?? 0 };
     }
   } catch {
